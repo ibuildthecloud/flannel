@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package flannel
 
 import (
 	"errors"
@@ -26,36 +26,21 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
-	"github.com/coreos/pkg/flagutil"
 	log "github.com/golang/glog"
 	"golang.org/x/net/context"
 
 	"github.com/coreos/flannel/network"
 	"github.com/coreos/flannel/pkg/ip"
 	"github.com/coreos/flannel/subnet"
-	"github.com/coreos/flannel/subnet/etcdv2"
 	"github.com/coreos/flannel/subnet/kube"
 	"github.com/coreos/flannel/version"
 
-	"time"
-
-	"github.com/joho/godotenv"
-
-	"sync"
-
 	// Backends need to be imported for their init() to get executed and them to register
 	"github.com/coreos/flannel/backend"
-	_ "github.com/coreos/flannel/backend/alivpc"
-	_ "github.com/coreos/flannel/backend/alloc"
-	_ "github.com/coreos/flannel/backend/awsvpc"
-	_ "github.com/coreos/flannel/backend/extension"
-	_ "github.com/coreos/flannel/backend/gce"
-	_ "github.com/coreos/flannel/backend/hostgw"
-	_ "github.com/coreos/flannel/backend/ipip"
-	_ "github.com/coreos/flannel/backend/ipsec"
-	_ "github.com/coreos/flannel/backend/udp"
 	_ "github.com/coreos/flannel/backend/vxlan"
 	"github.com/coreos/go-systemd/daemon"
 )
@@ -72,13 +57,6 @@ func (t *flagSlice) Set(val string) error {
 }
 
 type CmdLineOpts struct {
-	etcdEndpoints          string
-	etcdPrefix             string
-	etcdKeyfile            string
-	etcdCertfile           string
-	etcdCAFile             string
-	etcdUsername           string
-	etcdPassword           string
 	help                   bool
 	version                bool
 	kubeSubnetMgr          bool
@@ -106,30 +84,18 @@ var (
 )
 
 func init() {
-	flannelFlags.StringVar(&opts.etcdEndpoints, "etcd-endpoints", "http://127.0.0.1:4001,http://127.0.0.1:2379", "a comma-delimited list of etcd endpoints")
-	flannelFlags.StringVar(&opts.etcdPrefix, "etcd-prefix", "/coreos.com/network", "etcd prefix")
-	flannelFlags.StringVar(&opts.etcdKeyfile, "etcd-keyfile", "", "SSL key file used to secure etcd communication")
-	flannelFlags.StringVar(&opts.etcdCertfile, "etcd-certfile", "", "SSL certification file used to secure etcd communication")
-	flannelFlags.StringVar(&opts.etcdCAFile, "etcd-cafile", "", "SSL Certificate Authority file used to secure etcd communication")
-	flannelFlags.StringVar(&opts.etcdUsername, "etcd-username", "", "username for BasicAuth to etcd")
-	flannelFlags.StringVar(&opts.etcdPassword, "etcd-password", "", "password for BasicAuth to etcd")
 	flannelFlags.Var(&opts.iface, "iface", "interface to use (IP or name) for inter-host communication. Can be specified multiple times to check each option in order. Returns the first match found.")
 	flannelFlags.Var(&opts.ifaceRegex, "iface-regex", "regex expression to match the first interface to use (IP or name) for inter-host communication. Can be specified multiple times to check each regex in order. Returns the first match found. Regexes are checked after specific interfaces specified by the iface option have already been checked.")
 	flannelFlags.StringVar(&opts.subnetFile, "subnet-file", "/run/flannel/subnet.env", "filename where env variables (subnet, MTU, ... ) will be written to")
 	flannelFlags.StringVar(&opts.publicIP, "public-ip", "", "IP accessible by other nodes for inter-host communication")
 	flannelFlags.IntVar(&opts.subnetLeaseRenewMargin, "subnet-lease-renew-margin", 60, "subnet lease renewal margin, in minutes, ranging from 1 to 1439")
 	flannelFlags.BoolVar(&opts.ipMasq, "ip-masq", false, "setup IP masquerade rule for traffic destined outside of overlay network")
-	flannelFlags.BoolVar(&opts.kubeSubnetMgr, "kube-subnet-mgr", false, "contact the Kubernetes API for subnet assignment instead of etcd.")
 	flannelFlags.StringVar(&opts.kubeApiUrl, "kube-api-url", "", "Kubernetes API server URL. Does not need to be specified if flannel is running in a pod.")
 	flannelFlags.StringVar(&opts.kubeConfigFile, "kubeconfig-file", "", "kubeconfig file location. Does not need to be specified if flannel is running in a pod.")
 	flannelFlags.BoolVar(&opts.version, "version", false, "print version and exit")
 	flannelFlags.StringVar(&opts.healthzIP, "healthz-ip", "0.0.0.0", "the IP address for healthz server to listen")
 	flannelFlags.IntVar(&opts.healthzPort, "healthz-port", 0, "the port for healthz server to listen(0 to disable)")
 	flannelFlags.IntVar(&opts.iptablesResyncSeconds, "iptables-resync", 5, "resync period for iptables rules, in seconds")
-
-	// glog will log to tmp files by default. override so all entries
-	// can flow into journald (if running under systemd)
-	flag.Set("logtostderr", "true")
 
 	// Only copy the non file logging options from glog
 	copyFlag("v")
@@ -138,9 +104,6 @@ func init() {
 
 	// Define the usage function
 	flannelFlags.Usage = usage
-
-	// now parse command line args
-	flannelFlags.Parse(os.Args[1:])
 }
 
 func copyFlag(name string) {
@@ -154,33 +117,16 @@ func usage() {
 }
 
 func newSubnetManager() (subnet.Manager, error) {
-	if opts.kubeSubnetMgr {
-		return kube.NewSubnetManager(opts.kubeApiUrl, opts.kubeConfigFile)
-	}
-
-	cfg := &etcdv2.EtcdConfig{
-		Endpoints: strings.Split(opts.etcdEndpoints, ","),
-		Keyfile:   opts.etcdKeyfile,
-		Certfile:  opts.etcdCertfile,
-		CAFile:    opts.etcdCAFile,
-		Prefix:    opts.etcdPrefix,
-		Username:  opts.etcdUsername,
-		Password:  opts.etcdPassword,
-	}
-
-	// Attempt to renew the lease for the subnet specified in the subnetFile
-	prevSubnet := ReadSubnetFromSubnetFile(opts.subnetFile)
-
-	return etcdv2.NewLocalManager(cfg, prevSubnet)
+	return kube.NewSubnetManager(opts.kubeApiUrl, opts.kubeConfigFile)
 }
 
-func main() {
+func Main(args []string) {
+	flannelFlags.Parse(args)
+
 	if opts.version {
 		fmt.Fprintln(os.Stderr, version.Version)
 		os.Exit(0)
 	}
-
-	flagutil.SetFlagsFromEnv(flannelFlags, "FLANNELD")
 
 	// Validate flags
 	if opts.subnetLeaseRenewMargin >= 24*60 || opts.subnetLeaseRenewMargin <= 0 {
@@ -567,20 +513,4 @@ func mustRunHealthz() {
 		log.Errorf("Start healthz server error. %v", err)
 		panic(err)
 	}
-}
-
-func ReadSubnetFromSubnetFile(path string) ip.IP4Net {
-	var prevSubnet ip.IP4Net
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		prevSubnetVals, err := godotenv.Read(path)
-		if err != nil {
-			log.Errorf("Couldn't fetch previous subnet from subnet file at %s: %s", path, err)
-		} else if prevSubnetString, ok := prevSubnetVals["FLANNEL_SUBNET"]; ok {
-			err = prevSubnet.UnmarshalJSON([]byte(prevSubnetString))
-			if err != nil {
-				log.Errorf("Couldn't parse previous subnet from subnet file at %s: %s", path, err)
-			}
-		}
-	}
-	return prevSubnet
 }
