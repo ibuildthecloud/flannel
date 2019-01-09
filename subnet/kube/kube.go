@@ -62,7 +62,7 @@ type kubeSubnetManager struct {
 	events         chan subnet.Event
 }
 
-func NewSubnetManager(apiUrl, kubeconfig, prefix string) (subnet.Manager, error) {
+func NewSubnetManager(apiUrl, flannelConf, kubeconfig, prefix string) (subnet.Manager, error) {
 
 	var cfg *rest.Config
 	var err error
@@ -105,7 +105,10 @@ func NewSubnetManager(apiUrl, kubeconfig, prefix string) (subnet.Manager, error)
 		}
 	}
 
-	netConf, err := ioutil.ReadFile(netConfPath)
+	if flannelConf == "" {
+		flannelConf = netConfPath
+	}
+	netConf, err := ioutil.ReadFile(flannelConf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read net conf: %v", err)
 	}
